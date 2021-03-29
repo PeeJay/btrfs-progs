@@ -20,6 +20,7 @@
 #include <sys/xattr.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <sys/sysmacros.h>
 
 #include <btrfsutil.h>
 
@@ -166,6 +167,170 @@ out:
 	return ret;
 }
 
+static int btrfs_find_devid_and_mnt(const char *devpath, int *devid,
+				    char *path, int maxpath)
+{
+	int ret, i, fd;
+	DIR *dir;
+	struct stat stdevpath;
+	struct btrfs_ioctl_fs_info_args fi_args;
+	struct btrfs_ioctl_dev_info_args dev_info;
+
+	ret = get_btrfs_mount(devpath, path, maxpath);
+	if (ret)
+		return ret;
+
+	fd = btrfs_open_dir(path, &dir, 1);
+	if (fd < 0)
+		return fd;
+
+	ret = stat(devpath, &stdevpath);
+	if (ret) {
+		error("cannot stat '%s'", devpath);
+		goto out;
+	}
+
+	ret = ioctl(fd, BTRFS_IOC_FS_INFO, &fi_args);
+	if (ret < 0) {
+		if (errno == EPERM)
+			return -errno;
+		error("cannot get filesystem info: %m");
+		ret = -10;
+		goto out;
+	}
+
+	for (i = 0 ; i <= fi_args.max_id ; i++) {
+		struct stat st;
+
+		memset(&dev_info, 0, sizeof(dev_info));
+		ret = get_device_info(fd, i, &dev_info);
+		if (ret == -ENODEV)
+			continue;
+		if (ret) {
+			error("cannot get info about device devid=%d", i);
+			goto out;
+		}
+
+		if (!dev_info.path)
+			/* missing devices */
+			continue;
+
+		ret = stat((char *)dev_info.path, &st);
+		if (ret) {
+			error("cannot stat '%s'", devpath);
+			goto out;
+		}
+
+		if (major(st.st_rdev) == major(stdevpath.st_rdev) &&
+		    minor(st.st_rdev) == minor(stdevpath.st_rdev)) {
+			*devid = dev_info.devid;
+			ret = 0;
+			goto out;
+		}
+	}
+
+	ret = -12;
+
+out:
+	close_file_or_dir(fd, dir);
+	return ret;
+}
+
+static struct ull_charp_pair_t {
+	u64		value;
+	const char	*descr;
+} allocation_hint_description[] = {
+	{BTRFS_DEV_ALLOCATION_PREFERRED_METADATA, "PREFERRED_METADATA"},
+	{BTRFS_DEV_ALLOCATION_METADATA_ONLY, "METADATA_ONLY"},
+	{BTRFS_DEV_ALLOCATION_PREFERRED_DATA, "PREFERRED_DATA"},
+	{BTRFS_DEV_ALLOCATION_DATA_ONLY, "DATA_ONLY"},
+	{0, NULL}
+};
+
+
+static int prop_allocation_hint(enum prop_object_type type,
+				const char *object,
+				const char *name,
+				const char *value)
+{
+	int ret, devid, fd;
+	char path[PATH_MAX];
+	DIR *dir;
+	struct btrfs_ioctl_dev_properties props;
+	int i;
+	u64 v;
+
+	ret = btrfs_find_devid_and_mnt(object, &devid, path, sizeof(path));
+	if (ret)
+		return -5;
+
+	fd = btrfs_open_dir(path, &dir, 1);
+	if (fd < 0)
+		return fd;
+
+	memset(&props, 0, sizeof(props));
+	props.devid = devid;
+	props.properties = BTRFS_DEV_PROPERTY_TYPE|BTRFS_DEV_PROPERTY_READ;
+	ret = ioctl(fd, BTRFS_IOC_DEV_PROPERTIES, &props);
+	if (ret < 0) {
+		error("Cannot perform BTRFS_IOC_DEV_PROPERTIES ioctl on '%s'",
+				path);
+		ret = -1;
+		goto out;
+	}
+
+	if (!value) {
+		v = props.type & BTRFS_DEV_ALLOCATION_MASK;
+		for (i = 0 ; allocation_hint_description[i].descr ; i++)
+			if (v == allocation_hint_description[i].value)
+				break;
+		if (allocation_hint_description[i].descr)
+			printf("devid=%d, path=%s: allocation_hint=%s\n",
+				devid, object,
+				allocation_hint_description[i].descr);
+		else
+			printf("devid=%d, path=%s: allocation_hint=unknown:%llu\n",
+				devid, object,
+				v);
+		ret = 0;
+		goto out;
+	}
+
+	for (i = 0 ; allocation_hint_description[i].descr ; i++)
+		if (!strcmp(value, allocation_hint_description[i].descr))
+			break;
+
+	if (allocation_hint_description[i].descr) {
+		v = allocation_hint_description[i].value;
+	} else if (sscanf(value, "%llu", &v) != 1) {
+		error("Invalid value '%s'\n", value);
+		ret = -3;
+		goto out;
+	} else if (v & ~BTRFS_DEV_ALLOCATION_MASK) {
+		error("Invalid value '%s'\n", value);
+		ret = -3;
+		goto out;
+	}
+
+	props.type &= ~BTRFS_DEV_ALLOCATION_MASK;
+	props.type |= (v & BTRFS_DEV_ALLOCATION_MASK);
+
+	props.properties = BTRFS_DEV_PROPERTY_TYPE;
+	props.devid = devid;
+	ret = ioctl(fd, BTRFS_IOC_DEV_PROPERTIES, &props);
+	if (ret < 0) {
+		error("Cannot perform BTRFS_IOC_DEV_PROPERTIES ioctl on '%s'",
+			path);
+		ret = -4;
+		goto out;
+	}
+
+	ret = 0;
+out:
+	close_file_or_dir(fd, dir);
+	return ret;
+}
+
 const struct prop_handler prop_handlers[] = {
 	{
 		.name ="ro",
@@ -186,6 +351,12 @@ const struct prop_handler prop_handlers[] = {
 		.desc = "compression algorithm for the file or directory",
 		.read_only = 0,
 	 	.types = prop_object_inode, prop_compression
+	},
+	{
+		.name = "allocation_hint",
+		.desc = "hint to store the data/metadata chunks",
+		.types = prop_object_dev,
+		.handler = prop_allocation_hint
 	},
 	{NULL, NULL, 0, 0, NULL}
 };
